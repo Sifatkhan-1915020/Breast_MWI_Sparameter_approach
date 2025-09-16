@@ -1,0 +1,794 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+from scipy.interpolate import interp1d
+from scipy.signal import hilbert
+import cv2
+import os
+from skimage import measure, filters
+from scipy import ndimage
+import warnings
+
+# Handle Plotly dependency gracefully
+try:
+    import plotly.graph_objects as go
+    import plotly.express as px
+    from plotly.subplots import make_subplots
+    PLOTLY_AVAILABLE = True
+except ImportError:
+    PLOTLY_AVAILABLE = False
+    warnings.warn("Plotly not available. Using matplotlib fallback for 3D visualizations.")
+
+class FixedBreastPhantomImaging:
+    def __init__(self, phantom_radius=0.05):  # 50mm radius
+        self.phantom_radius = phantom_radius
+        self.frequency_range = np.linspace(17e9, 20e9, 1001)  # 17-20 GHz, 1001 points
+        self.c = 3e8  # Speed of light in m/s
+        
+        # Antenna positions (9 antennas total)
+        self.antenna_positions = self._setup_antenna_positions()
+        
+        # Tissue properties (simplified)
+        self.tissue_properties = {
+            'skin': {'epsilon_r': 36.4, 'sigma': 2.34},
+            'fat': {'epsilon_r': 4.84, 'sigma': 0.262},
+            'adipose': {'epsilon_r': 50, 'sigma': 3.46},
+            'tumor': {'epsilon_r': 70, 'sigma': 4.0}
+        }
+    
+    def _setup_antenna_positions(self):
+        """Setup antenna positions based on the configuration"""
+        positions = []
+        
+        # Antennas 1-7: 30 degree spacing on equator (semicircle)
+        for i in range(7):
+            angle = i * 30 * np.pi / 180  # Convert to radians
+            x = self.phantom_radius * np.cos(angle)
+            y = self.phantom_radius * np.sin(angle)
+            z = 0  # Equator level
+            positions.append([x, y, z])
+        
+        # Antenna 8: Top pole
+        positions.append([0, 0, self.phantom_radius])
+        
+        # Antenna 9: Bottom pole  
+        positions.append([0, 0, -self.phantom_radius])
+        
+        return np.array(positions)
+    
+    def load_s_parameters(self, csv_file_path):
+        """Load S-parameter data from CSV file"""
+        try:
+            # Read the CSV file
+            df = pd.read_csv(csv_file_path)
+            
+            # Handle different possible column names for frequency
+            freq_col = None
+            for col in ['Frequency', 'Freqnecy', 'freq', 'f']:  # Handle typos
+                if col in df.columns:
+                    freq_col = col
+                    break
+            
+            if freq_col is None:
+                print("Warning: Frequency column not found. Using first column.")
+                freq_col = df.columns[0]
+            
+            # Extract frequency and S-parameters
+            frequency = df[freq_col].values * 1e9  # Convert GHz to Hz
+            s_params = df.iloc[:, 1:].values  # All antenna S-parameters
+            
+            return frequency, s_params
+        except Exception as e:
+            print(f"Error loading S-parameters: {e}")
+            return None, None
+    
+    def preprocess_signals(self, frequency, s_params):
+        """Preprocess S-parameter signals"""
+        # Convert S-parameters from dB to linear scale
+        s_linear = 10**(s_params / 20)
+        
+        # Apply time-domain conversion using inverse FFT
+        time_signals = []
+        
+        for i in range(s_linear.shape[1]):
+            # Get frequency domain signal
+            freq_signal = s_linear[:, i]
+            
+            # Apply Hilbert transform to get analytic signal
+            analytic_signal = hilbert(freq_signal)
+            
+            # Convert to time domain
+            time_signal = np.fft.ifft(analytic_signal)
+            time_signals.append(time_signal)
+        
+        return np.array(time_signals)
+    
+    def calculate_propagation_delay(self, antenna_idx, pixel_position):
+        """Calculate propagation delay from antenna to pixel and back"""
+        antenna_pos = self.antenna_positions[antenna_idx]
+        
+        # Distance from antenna to pixel
+        distance = np.linalg.norm(pixel_position - antenna_pos)
+        
+        # Assume average dielectric properties for delay calculation
+        avg_epsilon_r = 20  # Average of tissue properties
+        avg_velocity = self.c / np.sqrt(avg_epsilon_r)
+        
+        # Round trip delay
+        delay = 2 * distance / avg_velocity
+        
+        return delay
+    
+    def delay_and_sum_beamforming(self, time_signals, image_size=(100, 100, 50)):
+        """Implement delay-and-sum beamforming algorithm"""
+        x_size, y_size, z_size = image_size
+        
+        # Create imaging grid
+        x_range = np.linspace(-self.phantom_radius, self.phantom_radius, x_size)
+        y_range = np.linspace(-self.phantom_radius, self.phantom_radius, y_size)
+        z_range = np.linspace(-self.phantom_radius, self.phantom_radius, z_size)
+        
+        # Initialize reconstructed image
+        reconstructed_image = np.zeros((x_size, y_size, z_size))
+        
+        # Time axis for signals
+        dt = 1 / (2 * np.max(self.frequency_range))
+        time_axis = np.arange(len(time_signals[0])) * dt
+        
+        print("Starting image reconstruction...")
+        
+        for i, x in enumerate(x_range):
+            if i % 10 == 0:
+                print(f"Processing slice {i}/{x_size}")
+                
+            for j, y in enumerate(y_range):
+                for k, z in enumerate(z_range):
+                    pixel_pos = np.array([x, y, z])
+                    
+                    # Check if pixel is inside phantom
+                    if np.linalg.norm(pixel_pos) > self.phantom_radius:
+                        continue
+                    
+                    # Sum delayed signals from all antennas
+                    pixel_intensity = 0
+                    
+                    for ant_idx in range(len(self.antenna_positions)):
+                        # Calculate delay for this antenna-pixel pair
+                        delay = self.calculate_propagation_delay(ant_idx, pixel_pos)
+                        
+                        # Find corresponding time index
+                        time_idx = int(delay / dt)
+                        
+                        if 0 <= time_idx < len(time_signals[ant_idx]):
+                            # Add delayed signal contribution
+                            signal_value = np.abs(time_signals[ant_idx][time_idx])
+                            pixel_intensity += signal_value
+                    
+                    reconstructed_image[i, j, k] = pixel_intensity
+        
+        return reconstructed_image, (x_range, y_range, z_range)
+    
+    def enhance_tumor_visualization(self, image):
+        """Apply image enhancement techniques for better tumor visualization"""
+        # Normalize image
+        image_norm = (image - np.min(image)) / (np.max(image) - np.min(image))
+        
+        # Apply dynamic range compression
+        image_enhanced = np.power(image_norm, 0.5)
+        
+        # Apply median filtering to reduce noise
+        for z in range(image_enhanced.shape[2]):
+            image_enhanced[:, :, z] = cv2.medianBlur(
+                (image_enhanced[:, :, z] * 255).astype(np.uint8), 3
+            ) / 255.0
+        
+        return image_enhanced
+    
+    def save_individual_plane_images(self, image, grid_ranges, output_dir="plane_images"):
+        """Save individual plane images as separate files"""
+        x_range, y_range, z_range = grid_ranges
+        
+        # Create output directory
+        os.makedirs(output_dir, exist_ok=True)
+        
+        print(f"Saving individual plane images to '{output_dir}' directory...")
+        
+        # Save all axial planes (XY planes)
+        axial_dir = os.path.join(output_dir, "axial")
+        os.makedirs(axial_dir, exist_ok=True)
+        
+        for z_idx in range(image.shape[2]):
+            plt.figure(figsize=(8, 8))
+            plt.imshow(image[:, :, z_idx].T,
+                      extent=[x_range[0]*1000, x_range[-1]*1000,
+                             y_range[0]*1000, y_range[-1]*1000],
+                      aspect='equal', cmap='hot', origin='lower')
+            plt.title(f'Axial Plane - Z = {z_range[z_idx]*1000:.1f} mm')
+            plt.xlabel('X (mm)')
+            plt.ylabel('Y (mm)')
+            plt.colorbar(label='Intensity')
+            plt.savefig(os.path.join(axial_dir, f'axial_z{z_idx:03d}.png'), 
+                       dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # Save all coronal planes (XZ planes)
+        coronal_dir = os.path.join(output_dir, "coronal")
+        os.makedirs(coronal_dir, exist_ok=True)
+        
+        for y_idx in range(image.shape[1]):
+            plt.figure(figsize=(8, 8))
+            plt.imshow(image[:, y_idx, :].T,
+                      extent=[x_range[0]*1000, x_range[-1]*1000,
+                             z_range[0]*1000, z_range[-1]*1000],
+                      aspect='equal', cmap='hot', origin='lower')
+            plt.title(f'Coronal Plane - Y = {y_range[y_idx]*1000:.1f} mm')
+            plt.xlabel('X (mm)')
+            plt.ylabel('Z (mm)')
+            plt.colorbar(label='Intensity')
+            plt.savefig(os.path.join(coronal_dir, f'coronal_y{y_idx:03d}.png'), 
+                       dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        # Save all sagittal planes (YZ planes)
+        sagittal_dir = os.path.join(output_dir, "sagittal")
+        os.makedirs(sagittal_dir, exist_ok=True)
+        
+        for x_idx in range(image.shape[0]):
+            plt.figure(figsize=(8, 8))
+            plt.imshow(image[x_idx, :, :].T,
+                      extent=[y_range[0]*1000, y_range[-1]*1000,
+                             z_range[0]*1000, z_range[-1]*1000],
+                      aspect='equal', cmap='hot', origin='lower')
+            plt.title(f'Sagittal Plane - X = {x_range[x_idx]*1000:.1f} mm')
+            plt.xlabel('Y (mm)')
+            plt.ylabel('Z (mm)')
+            plt.colorbar(label='Intensity')
+            plt.savefig(os.path.join(sagittal_dir, f'sagittal_x{x_idx:03d}.png'), 
+                       dpi=300, bbox_inches='tight')
+            plt.close()
+        
+        print(f"Saved {image.shape[2]} axial, {image.shape[1]} coronal, and {image.shape[0]} sagittal plane images")
+    
+    def create_3d_volume_rendering_matplotlib(self, image, grid_ranges, threshold_percentile=85):
+        """Create 3D volume rendering using matplotlib (fallback)"""
+        x_range, y_range, z_range = grid_ranges
+        
+        # Normalize and threshold image
+        image_norm = (image - np.min(image)) / (np.max(image) - np.min(image))
+        threshold = np.percentile(image_norm[image_norm > 0], threshold_percentile)
+        
+        # Create meshgrid
+        X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
+        
+        # Find high-intensity voxels
+        high_intensity_mask = image_norm > threshold
+        indices = np.where(high_intensity_mask)
+        
+        if len(indices[0]) == 0:
+            print("No high-intensity regions found. Lowering threshold...")
+            threshold = np.percentile(image_norm[image_norm > 0], 70)
+            high_intensity_mask = image_norm > threshold
+            indices = np.where(high_intensity_mask)
+        
+        # Create 3D plot
+        fig = plt.figure(figsize=(15, 5))
+        
+        # Plot 1: 3D scatter of tumor regions
+        ax1 = plt.subplot(131, projection='3d')
+        
+        if len(indices[0]) > 0:
+            colors = image_norm[indices]
+            
+            # Subsample for better performance
+            step = max(1, len(indices[0]) // 1000)
+            
+            scatter = ax1.scatter(
+                X[indices][::step] * 1000,
+                Y[indices][::step] * 1000,
+                Z[indices][::step] * 1000,
+                c=colors[::step],
+                cmap='hot',
+                alpha=0.6,
+                s=20
+            )
+            plt.colorbar(scatter, ax=ax1, shrink=0.6, label='Intensity')
+        
+        ax1.set_title('3D Tumor Regions')
+        ax1.set_xlabel('X (mm)')
+        ax1.set_ylabel('Y (mm)')
+        ax1.set_zlabel('Z (mm)')
+        
+        # Plot 2: Cross-sectional view with contours
+        ax2 = plt.subplot(132)
+        
+        z_center = len(z_range) // 2
+        im = ax2.imshow(image[:, :, z_center].T,
+                       extent=[x_range[0]*1000, x_range[-1]*1000,
+                              y_range[0]*1000, y_range[-1]*1000],
+                       aspect='equal', cmap='hot', origin='lower')
+        
+        # Add contour lines for tumor regions
+        tumor_slice = image_norm[:, :, z_center] > threshold
+        if np.any(tumor_slice):
+            ax2.contour(np.linspace(x_range[0]*1000, x_range[-1]*1000, tumor_slice.shape[0]),
+                       np.linspace(y_range[0]*1000, y_range[-1]*1000, tumor_slice.shape[1]),
+                       tumor_slice.T, colors='cyan', linewidths=2)
+        
+        ax2.set_title(f'Central Axial Slice (Z={z_range[z_center]*1000:.1f}mm)')
+        ax2.set_xlabel('X (mm)')
+        ax2.set_ylabel('Y (mm)')
+        plt.colorbar(im, ax=ax2)
+        
+        # Plot 3: Maximum intensity projection
+        ax3 = plt.subplot(133)
+        
+        max_proj = np.max(image_norm, axis=2)
+        im3 = ax3.imshow(max_proj.T,
+                        extent=[x_range[0]*1000, x_range[-1]*1000,
+                               y_range[0]*1000, y_range[-1]*1000],
+                        aspect='equal', cmap='hot', origin='lower')
+        
+        ax3.set_title('Maximum Intensity Projection')
+        ax3.set_xlabel('X (mm)')
+        ax3.set_ylabel('Y (mm)')
+        plt.colorbar(im3, ax=ax3)
+        
+        plt.tight_layout()
+        plt.savefig('3d_volume_rendering_matplotlib.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return fig
+    
+    def create_3d_volume_rendering_plotly(self, image, grid_ranges, threshold_percentile=85):
+        """Create 3D volume rendering using Plotly (if available)"""
+        if not PLOTLY_AVAILABLE:
+            print("Plotly not available. Using matplotlib fallback.")
+            return self.create_3d_volume_rendering_matplotlib(image, grid_ranges, threshold_percentile)
+        
+        x_range, y_range, z_range = grid_ranges
+        
+        # Normalize and threshold image
+        image_norm = (image - np.min(image)) / (np.max(image) - np.min(image))
+        threshold = np.percentile(image_norm[image_norm > 0], threshold_percentile)
+        
+        # Create meshgrid
+        X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
+        
+        # Create 3D volume plot
+        fig = go.Figure()
+        
+        # Add volume rendering
+        fig.add_trace(go.Volume(
+            x=X.flatten() * 1000,  # Convert to mm
+            y=Y.flatten() * 1000,
+            z=Z.flatten() * 1000,
+            value=image_norm.flatten(),
+            isomin=threshold,
+            isomax=1.0,
+            opacity=0.3,
+            surface_count=15,
+            colorscale='Hot',
+            name='Breast Tissue Volume'
+        ))
+        
+        # Add antenna positions
+        antenna_pos = self.antenna_positions
+        fig.add_trace(go.Scatter3d(
+            x=antenna_pos[:, 0] * 1000,
+            y=antenna_pos[:, 1] * 1000,
+            z=antenna_pos[:, 2] * 1000,
+            mode='markers+text',
+            marker=dict(size=10, color='blue', symbol='diamond'),
+            text=[f'Ant{i+1}' for i in range(len(antenna_pos))],
+            textposition="top center",
+            name='Antennas'
+        ))
+        
+        # Update layout
+        fig.update_layout(
+            title='3D Volume Rendering - Breast Phantom Reconstruction',
+            scene=dict(
+                xaxis_title='X (mm)',
+                yaxis_title='Y (mm)',
+                zaxis_title='Z (mm)',
+                aspectmode='cube'
+            ),
+            width=1000,
+            height=800
+        )
+        
+        # Save as HTML but don't show in notebook to avoid dependency issues
+        try:
+            fig.write_html("3d_volume_rendering.html")
+            print("3D volume rendering saved as '3d_volume_rendering.html'")
+            print("Open this file in a web browser to view the interactive 3D visualization.")
+        except Exception as e:
+            print(f"Could not save HTML file: {e}")
+            print("Using matplotlib fallback.")
+            return self.create_3d_volume_rendering_matplotlib(image, grid_ranges, threshold_percentile)
+        
+        return fig
+    
+    def create_3d_isosurface(self, image, grid_ranges, threshold_percentile=90):
+        """Create 3D isosurface using marching cubes"""
+        x_range, y_range, z_range = grid_ranges
+        
+        # Normalize image
+        image_norm = (image - np.min(image)) / (np.max(image) - np.min(image))
+        threshold = np.percentile(image_norm[image_norm > 0], threshold_percentile)
+        
+        fig = plt.figure(figsize=(15, 5))
+        
+        # Plot 1: 3D scatter plot of high-intensity regions
+        ax1 = plt.subplot(131, projection='3d')
+        
+        # Find high-intensity voxels
+        high_intensity_mask = image_norm > threshold
+        indices = np.where(high_intensity_mask)
+        
+        if len(indices[0]) > 0:
+            X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
+            colors = image_norm[indices]
+            
+            # Subsample for performance
+            step = max(1, len(indices[0]) // 500)
+            
+            scatter = ax1.scatter(
+                X[indices][::step] * 1000,
+                Y[indices][::step] * 1000,
+                Z[indices][::step] * 1000,
+                c=colors[::step],
+                cmap='hot',
+                alpha=0.7,
+                s=30
+            )
+            plt.colorbar(scatter, ax=ax1, shrink=0.6, label='Intensity')
+        
+        ax1.set_title('3D Scatter Plot (High Intensity)')
+        ax1.set_xlabel('X (mm)')
+        ax1.set_ylabel('Y (mm)')
+        ax1.set_zlabel('Z (mm)')
+        
+        # Plot 2: Marching cubes isosurface
+        ax2 = plt.subplot(132, projection='3d')
+        
+        try:
+            # Apply marching cubes
+            verts, faces, _, _ = measure.marching_cubes(
+                image_norm, 
+                level=threshold,
+                spacing=(
+                    (x_range[-1] - x_range[0]) / len(x_range),
+                    (y_range[-1] - y_range[0]) / len(y_range),
+                    (z_range[-1] - z_range[0]) / len(z_range)
+                )
+            )
+            
+            # Adjust vertices to real coordinates
+            verts[:, 0] = verts[:, 0] + x_range[0]
+            verts[:, 1] = verts[:, 1] + y_range[0]
+            verts[:, 2] = verts[:, 2] + z_range[0]
+            
+            # Plot surface (subsample faces for performance)
+            face_step = max(1, len(faces) // 1000)
+            ax2.plot_trisurf(
+                verts[:, 0] * 1000, 
+                verts[:, 1] * 1000, 
+                verts[:, 2] * 1000,
+                triangles=faces[::face_step],
+                alpha=0.8,
+                cmap='hot'
+            )
+            
+        except Exception as e:
+            print(f"Marching cubes failed: {e}")
+            # Fallback to scatter plot
+            if len(indices[0]) > 0:
+                ax2.scatter(
+                    X[indices][::step] * 1000,
+                    Y[indices][::step] * 1000,
+                    Z[indices][::step] * 1000,
+                    c='red',
+                    alpha=0.7,
+                    s=20
+                )
+        
+        ax2.set_title('3D Isosurface (Marching Cubes)')
+        ax2.set_xlabel('X (mm)')
+        ax2.set_ylabel('Y (mm)')
+        ax2.set_zlabel('Z (mm)')
+        
+        # Plot 3: Connected components analysis
+        ax3 = plt.subplot(133, projection='3d')
+        
+        # Find connected components
+        labeled_regions, num_regions = ndimage.label(high_intensity_mask)
+        
+        print(f"Found {num_regions} connected regions")
+        
+        colors_list = plt.cm.Set1(np.linspace(0, 1, min(num_regions, 10)))
+        
+        for region_id in range(1, min(num_regions + 1, 11)):  # Limit to 10 regions
+            region_indices = np.where(labeled_regions == region_id)
+            if len(region_indices[0]) > 5:  # Only show significant regions
+                color_idx = (region_id - 1) % 10
+                
+                # Subsample region points
+                step = max(1, len(region_indices[0]) // 100)
+                
+                ax3.scatter(
+                    X[region_indices][::step] * 1000,
+                    Y[region_indices][::step] * 1000,
+                    Z[region_indices][::step] * 1000,
+                    c=[colors_list[color_idx]],
+                    alpha=0.8,
+                    s=40,
+                    label=f'Region {region_id}'
+                )
+        
+        ax3.set_title('Connected Components')
+        ax3.set_xlabel('X (mm)')
+        ax3.set_ylabel('Y (mm)')
+        ax3.set_zlabel('Z (mm)')
+        ax3.legend()
+        
+        plt.tight_layout()
+        plt.savefig('3d_reconstruction_analysis.png', dpi=300, bbox_inches='tight')
+        plt.show()
+        
+        return labeled_regions, num_regions
+    
+    def generate_tumor_statistics(self, image, grid_ranges, threshold_percentile=85):
+        """Generate comprehensive tumor statistics"""
+        x_range, y_range, z_range = grid_ranges
+        
+        # Normalize image
+        image_norm = (image - np.min(image)) / (np.max(image) - np.min(image))
+        threshold = np.percentile(image_norm[image_norm > 0], threshold_percentile)
+        
+        # Find connected components
+        tumor_mask = image_norm > threshold
+        labeled_tumors, num_tumors = ndimage.label(tumor_mask)
+        
+        # Create meshgrid for calculations
+        X, Y, Z = np.meshgrid(x_range, y_range, z_range, indexing='ij')
+        
+        print("=== COMPREHENSIVE TUMOR ANALYSIS ===")
+        print(f"Detection threshold ({threshold_percentile}th percentile): {threshold:.3f}")
+        print(f"Number of tumor regions detected: {num_tumors}")
+        
+        tumor_stats = []
+        
+        for tumor_id in range(1, num_tumors + 1):
+            tumor_indices = np.where(labeled_tumors == tumor_id)
+            
+            if len(tumor_indices[0]) < 5:  # Skip very small regions
+                continue
+            
+            # Calculate voxel volume
+            voxel_volume = np.prod([
+                (x_range[-1] - x_range[0]) / len(x_range),
+                (y_range[-1] - y_range[0]) / len(y_range),
+                (z_range[-1] - z_range[0]) / len(z_range)
+            ]) * 1e9  # Convert to mm³
+            
+            # Tumor properties
+            tumor_volume = len(tumor_indices[0]) * voxel_volume
+            
+            # Center of mass
+            center_x = np.mean(X[tumor_indices]) * 1000
+            center_y = np.mean(Y[tumor_indices]) * 1000
+            center_z = np.mean(Z[tumor_indices]) * 1000
+            
+            # Intensity statistics
+            max_intensity = np.max(image_norm[tumor_indices])
+            avg_intensity = np.mean(image_norm[tumor_indices])
+            std_intensity = np.std(image_norm[tumor_indices])
+            
+            # Geometric properties
+            equiv_diameter = 2 * (3 * tumor_volume / (4 * np.pi)) ** (1/3)
+            
+            # Bounding box
+            min_x = np.min(X[tumor_indices]) * 1000
+            max_x = np.max(X[tumor_indices]) * 1000
+            min_y = np.min(Y[tumor_indices]) * 1000
+            max_y = np.max(Y[tumor_indices]) * 1000
+            min_z = np.min(Z[tumor_indices]) * 1000
+            max_z = np.max(Z[tumor_indices]) * 1000
+            
+            tumor_info = {
+                'id': tumor_id,
+                'volume_mm3': tumor_volume,
+                'center': (center_x, center_y, center_z),
+                'max_intensity': max_intensity,
+                'avg_intensity': avg_intensity,
+                'std_intensity': std_intensity,
+                'equiv_diameter_mm': equiv_diameter,
+                'voxel_count': len(tumor_indices[0]),
+                'bounding_box': {
+                    'x_range': (min_x, max_x),
+                    'y_range': (min_y, max_y),
+                    'z_range': (min_z, max_z)
+                }
+            }
+            
+            tumor_stats.append(tumor_info)
+            
+            print(f"\nTumor Region {tumor_id}:")
+            print(f"  Volume: {tumor_volume:.2f} mm³")
+            print(f"  Center: ({center_x:.1f}, {center_y:.1f}, {center_z:.1f}) mm")
+            print(f"  Equivalent diameter: {equiv_diameter:.2f} mm")
+            print(f"  Intensity - Max: {max_intensity:.3f}, Avg: {avg_intensity:.3f}, Std: {std_intensity:.3f}")
+            print(f"  Bounding box: X[{min_x:.1f}, {max_x:.1f}], Y[{min_y:.1f}, {max_y:.1f}], Z[{min_z:.1f}, {max_z:.1f}] mm")
+        
+        return tumor_stats
+    
+    def visualize_results_comprehensive(self, image, grid_ranges, save_path=None):
+        """Comprehensive visualization with individual plane saving"""
+        x_range, y_range, z_range = grid_ranges
+        
+        # Create main summary figure
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        # Central slices
+        z_center = len(z_range) // 2
+        y_center = len(y_range) // 2
+        x_center = len(x_range) // 2
+        
+        # XY plane (axial slice)
+        im1 = axes[0, 0].imshow(image[:, :, z_center].T, 
+                               extent=[x_range[0]*1000, x_range[-1]*1000, 
+                                      y_range[0]*1000, y_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[0, 0].set_title(f'XY Plane (Axial) - Z = {z_range[z_center]*1000:.1f} mm')
+        axes[0, 0].set_xlabel('X (mm)')
+        axes[0, 0].set_ylabel('Y (mm)')
+        plt.colorbar(im1, ax=axes[0, 0])
+        
+        # XZ plane (coronal slice)
+        im2 = axes[0, 1].imshow(image[:, y_center, :].T,
+                               extent=[x_range[0]*1000, x_range[-1]*1000,
+                                      z_range[0]*1000, z_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[0, 1].set_title(f'XZ Plane (Coronal) - Y = {y_range[y_center]*1000:.1f} mm')
+        axes[0, 1].set_xlabel('X (mm)')
+        axes[0, 1].set_ylabel('Z (mm)')
+        plt.colorbar(im2, ax=axes[0, 1])
+        
+        # YZ plane (sagittal slice)
+        im3 = axes[0, 2].imshow(image[x_center, :, :].T,
+                               extent=[y_range[0]*1000, y_range[-1]*1000,
+                                      z_range[0]*1000, z_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[0, 2].set_title(f'YZ Plane (Sagittal) - X = {x_range[x_center]*1000:.1f} mm')
+        axes[0, 2].set_xlabel('Y (mm)')
+        axes[0, 2].set_ylabel('Z (mm)')
+        plt.colorbar(im3, ax=axes[0, 2])
+        
+        # Maximum intensity projections
+        max_proj_xy = np.max(image, axis=2)
+        max_proj_xz = np.max(image, axis=1)
+        max_proj_yz = np.max(image, axis=0)
+        
+        im4 = axes[1, 0].imshow(max_proj_xy.T,
+                               extent=[x_range[0]*1000, x_range[-1]*1000,
+                                      y_range[0]*1000, y_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[1, 0].set_title('Maximum Intensity Projection (XY)')
+        axes[1, 0].set_xlabel('X (mm)')
+        axes[1, 0].set_ylabel('Y (mm)')
+        plt.colorbar(im4, ax=axes[1, 0])
+        
+        im5 = axes[1, 1].imshow(max_proj_xz.T,
+                               extent=[x_range[0]*1000, x_range[-1]*1000,
+                                      z_range[0]*1000, z_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[1, 1].set_title('Maximum Intensity Projection (XZ)')
+        axes[1, 1].set_xlabel('X (mm)')
+        axes[1, 1].set_ylabel('Z (mm)')
+        plt.colorbar(im5, ax=axes[1, 1])
+        
+        im6 = axes[1, 2].imshow(max_proj_yz.T,
+                               extent=[y_range[0]*1000, y_range[-1]*1000,
+                                      z_range[0]*1000, z_range[-1]*1000],
+                               aspect='equal', cmap='hot', origin='lower')
+        axes[1, 2].set_title('Maximum Intensity Projection (YZ)')
+        axes[1, 2].set_xlabel('Y (mm)')
+        axes[1, 2].set_ylabel('Z (mm)')
+        plt.colorbar(im6, ax=axes[1, 2])
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        
+        plt.show()
+
+def main():
+    """Fixed main reconstruction pipeline with dependency handling"""
+    # Initialize fixed imaging system
+    imaging_system = FixedBreastPhantomImaging(phantom_radius=0.05)
+    
+    # Load S-parameter data
+    csv_file_path = "tumor_rad_5.csv"  # Update this path
+    frequency, s_params = imaging_system.load_s_parameters(csv_file_path)
+    
+    if frequency is None:
+        print("Failed to load S-parameter data. Creating synthetic data for demonstration.")
+        frequency = np.linspace(17e9, 20e9, 1001)
+        s_params = np.random.randn(1001, 9) * 5 - 50
+    
+    print(f"Loaded S-parameter data: {s_params.shape}")
+    print(f"Frequency range: {frequency[0]/1e9:.2f} - {frequency[-1]/1e9:.2f} GHz")
+    
+    # Preprocess signals
+    print("Preprocessing signals...")
+    time_signals = imaging_system.preprocess_signals(frequency, s_params)
+    
+    # Perform image reconstruction
+    print("Starting image reconstruction...")
+    reconstructed_image, grid_ranges = imaging_system.delay_and_sum_beamforming(
+        time_signals, image_size=(60, 60, 30)
+    )
+    
+    # Enhance tumor visualization
+    print("Enhancing image for tumor visualization...")
+    enhanced_image = imaging_system.enhance_tumor_visualization(reconstructed_image)
+    
+    # 1. Save comprehensive visualization
+    print("Creating comprehensive visualization...")
+    imaging_system.visualize_results_comprehensive(
+        enhanced_image, grid_ranges, 
+        save_path="comprehensive_reconstruction_results.png"
+    )
+    
+    # 2. Save individual plane images
+    print("Saving individual plane images...")
+    imaging_system.save_individual_plane_images(enhanced_image, grid_ranges)
+    
+    # 3. Create 3D volume rendering (with fallback)
+    print("Creating 3D volume rendering...")
+    try:
+        if PLOTLY_AVAILABLE:
+            volume_fig = imaging_system.create_3d_volume_rendering_plotly(enhanced_image, grid_ranges)
+        else:
+            volume_fig = imaging_system.create_3d_volume_rendering_matplotlib(enhanced_image, grid_ranges)
+    except Exception as e:
+        print(f"3D volume rendering failed: {e}")
+        print("Continuing with other visualizations...")
+    
+    # 4. Create 3D isosurface analysis
+    print("Creating 3D isosurface analysis...")
+    try:
+        labeled_regions, num_regions = imaging_system.create_3d_isosurface(enhanced_image, grid_ranges)
+    except Exception as e:
+        print(f"3D isosurface analysis failed: {e}")
+        labeled_regions, num_regions = None, 0
+    
+    # 5. Generate tumor statistics
+    print("Generating tumor statistics...")
+    tumor_stats = imaging_system.generate_tumor_statistics(enhanced_image, grid_ranges)
+    
+    print("\n=== RECONSTRUCTION COMPLETE ===")
+    print("Generated outputs:")
+    print("- comprehensive_reconstruction_results.png")
+    print("- plane_images/ directory with individual slices")
+    
+    if PLOTLY_AVAILABLE:
+        print("- 3d_volume_rendering.html (interactive)")
+    else:
+        print("- 3d_volume_rendering_matplotlib.png")
+    
+    print("- 3d_reconstruction_analysis.png")
+    
+    return enhanced_image, grid_ranges, tumor_stats
+
+if __name__ == "__main__":
+    # Run the fixed reconstruction pipeline
+    try:
+        result_image, grid_ranges, tumor_statistics = main()
+        print("\nReconstruction completed successfully!")
+    except Exception as e:
+        print(f"Error during reconstruction: {e}")
+        print("Please check your input data and dependencies.")
