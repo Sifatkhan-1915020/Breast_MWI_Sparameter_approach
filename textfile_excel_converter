@@ -1,0 +1,328 @@
+import pandas as pd
+import re
+import os
+from pathlib import Path
+
+def parse_text_to_csv_by_frequency(input_file_path, output_file_path):
+    """
+    Parse text file and create new columns when frequency starts with 17.
+    Column names will be S1,1, S2,1, S3,1, etc.
+    """
+    
+    # Dictionary to store data for each frequency group
+    data_dict = {}
+    current_tumor_rad = None
+    current_s_parameter = None
+    column_counter = 1
+    
+    try:
+        # Read the text file with encoding handling
+        with open(input_file_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+    except UnicodeDecodeError:
+        # Try with different encoding if utf-8 fails
+        with open(input_file_path, 'r', encoding='latin-1') as file:
+            lines = file.readlines()
+    
+    print(f"Processing {len(lines)} lines from {input_file_path}")
+    
+    # Process each line
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        
+        # Skip empty lines
+        if not line:
+            continue
+            
+        # Check if line contains tumor_rad parameter or S-parameter info
+        if 'tumor_rad=' in line:
+            # Extract tumor_rad value using regex
+            match = re.search(r'tumor_rad=(\d+(?:\.\d+)?)', line)
+            if match:
+                current_tumor_rad = float(match.group(1))
+                print(f"Found tumor_rad={current_tumor_rad} at line {line_num}")
+        
+        # Check for S-parameter in the line (like S1,1, S2,1, etc.)
+        if re.search(r'S\d+,\d+', line):
+            s_param_match = re.search(r'S(\d+),(\d+)', line)
+            if s_param_match:
+                current_s_parameter = f"S{s_param_match.group(1)},{s_param_match.group(2)}"
+                print(f"Found S-parameter: {current_s_parameter} at line {line_num}")
+        
+        # Skip header lines and separator lines
+        elif (line.startswith('#') or 
+              line.startswith('-') or 
+              'Frequency' in line or 
+              'Magnitude' in line):
+            continue
+            
+        # Process data lines (should contain two numbers)
+        else:
+            try:
+                # Split the line and extract frequency and magnitude
+                parts = line.split()
+                if len(parts) >= 2:
+                    frequency = float(parts[0])
+                    magnitude = float(parts[1])
+                    
+                    # Check if frequency starts with 17
+                    if str(frequency).startswith('17.'):
+                        # Create column name based on S-parameter or use default naming
+                        if current_s_parameter:
+                            column_name = current_s_parameter
+                        else:
+                            column_name = f"S{column_counter},{column_counter}"
+                        
+                        # Initialize column if not exists
+                        if column_name not in data_dict:
+                            data_dict[column_name] = {'frequency': [], 'magnitude': []}
+                            print(f"Created new column: {column_name}")
+                        
+                        data_dict[column_name]['frequency'].append(frequency)
+                        data_dict[column_name]['magnitude'].append(magnitude)
+                        
+            except (ValueError, IndexError) as e:
+                print(f"Warning: Could not parse line {line_num}: {line[:50]}...")
+                continue
+    
+    # If no S-parameter was found in headers, use sequential numbering
+    if not data_dict:
+        print("No frequency data starting with 17 found!")
+        return None
+    
+    # Create DataFrame from the parsed data
+    print(f"Found data for S-parameters: {list(data_dict.keys())}")
+    
+    # Find the maximum length among all datasets
+    max_length = max(len(data['frequency']) for data in data_dict.values())
+    print(f"Maximum data points per S-parameter: {max_length}")
+    
+    # Create the final DataFrame
+    df_data = {}
+    
+    # Add frequency column first (use the first dataset's frequency)
+    first_key = list(data_dict.keys())[0]
+    frequencies = data_dict[first_key]['frequency'].copy()
+    while len(frequencies) < max_length:
+        frequencies.append(None)
+    df_data['Frequency_GHz'] = frequencies
+    
+    # Add columns for each S-parameter
+    for s_param in sorted(data_dict.keys()):
+        mag_data = data_dict[s_param]['magnitude'].copy()
+        
+        # Pad with NaN if necessary to match max_length
+        while len(mag_data) < max_length:
+            mag_data.append(None)
+        
+        # Use S-parameter name directly as column name
+        df_data[s_param] = mag_data
+    
+    # Create DataFrame
+    df = pd.DataFrame(df_data)
+    
+    # Create output directory if it doesn't exist
+    output_path = Path(output_file_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Save to CSV file
+    df.to_csv(output_file_path, index=False)
+    print(f"Data successfully converted and saved to: {output_file_path}")
+    
+    print(f"DataFrame shape: {df.shape}")
+    print(f"Columns created: {list(df.columns)}")
+    
+    return df
+
+def parse_text_to_csv_auto_detect(input_file_path, output_file_path):
+    """
+    Alternative version that auto-detects new frequency groups and creates S-parameter columns
+    """
+    
+    frequency_groups = {}
+    current_tumor_rad = None
+    s_param_counter = 1
+    
+    try:
+        with open(input_file_path, 'r', encoding='utf-8') as file:
+            lines = file.readlines()
+    except UnicodeDecodeError:
+        with open(input_file_path, 'r', encoding='latin-1') as file:
+            lines = file.readlines()
+    
+    print(f"Processing {len(lines)} lines from {input_file_path}")
+    
+    # First pass: identify frequency groups
+    current_freq_group = None
+    
+    for line_num, line in enumerate(lines, 1):
+        line = line.strip()
+        
+        if not line:
+            continue
+            
+        # Check for tumor_rad parameter change
+        if 'tumor_rad=' in line:
+            match = re.search(r'tumor_rad=(\d+(?:\.\d+)?)', line)
+            if match:
+                current_tumor_rad = float(match.group(1))
+                current_freq_group = f"tumor_rad_{current_tumor_rad}"
+                print(f"Starting new frequency group for tumor_rad={current_tumor_rad}")
+                
+        # Skip header lines
+        elif (line.startswith('#') or line.startswith('-') or 
+              'Frequency' in line or 'Magnitude' in line):
+            continue
+            
+        # Process data lines
+        else:
+            try:
+                parts = line.split()
+                if len(parts) >= 2:
+                    frequency = float(parts[0])
+                    magnitude = float(parts[1])
+                    
+                    # Check if frequency starts with 17
+                    if str(frequency).startswith('17.'):
+                        if current_freq_group not in frequency_groups:
+                            frequency_groups[current_freq_group] = {
+                                'frequency': [],
+                                'magnitude': [],
+                                's_param': f"S{s_param_counter},{s_param_counter}"
+                            }
+                            s_param_counter += 1
+                        
+                        frequency_groups[current_freq_group]['frequency'].append(frequency)
+                        frequency_groups[current_freq_group]['magnitude'].append(magnitude)
+                        
+            except (ValueError, IndexError):
+                continue
+    
+    if not frequency_groups:
+        print("No frequency data starting with 17 found!")
+        return None
+    
+    # Create DataFrame
+    max_length = max(len(group['frequency']) for group in frequency_groups.values())
+    
+    df_data = {}
+    
+    # Add frequency column from first group
+    first_group = list(frequency_groups.values())[0]
+    frequencies = first_group['frequency'].copy()
+    while len(frequencies) < max_length:
+        frequencies.append(None)
+    df_data['Frequency_GHz'] = frequencies
+    
+    # Add S-parameter columns
+    for group_name, group_data in frequency_groups.items():
+        s_param = group_data['s_param']
+        mag_data = group_data['magnitude'].copy()
+        
+        while len(mag_data) < max_length:
+            mag_data.append(None)
+        
+        df_data[s_param] = mag_data
+        print(f"Created column {s_param} for {group_name}")
+    
+    df = pd.DataFrame(df_data)
+    
+    # Save to CSV
+    output_path = Path(output_file_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(output_file_path, index=False)
+    
+    print(f"Data successfully converted and saved to: {output_file_path}")
+    print(f"DataFrame shape: {df.shape}")
+    print(f"Columns created: {list(df.columns)}")
+    
+    return df
+
+def preview_data(df, num_rows=10):
+    """
+    Display a preview of the converted data
+    """
+    print("\n" + "="*60)
+    print("DATA PREVIEW")
+    print("="*60)
+    print(df.head(num_rows))
+    print(f"\nTotal rows: {len(df)}")
+    print(f"Total columns: {len(df.columns)}")
+
+def batch_convert_s_parameters(input_directory, output_directory):
+    """
+    Convert multiple text files in a directory to CSV format with S-parameter columns
+    """
+    input_path = Path(input_directory)
+    output_path = Path(output_directory)
+    
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    txt_files = list(input_path.glob("*.txt"))
+    
+    if not txt_files:
+        print(f"No .txt files found in {input_directory}")
+        return
+    
+    print(f"Found {len(txt_files)} text files to convert")
+    
+    for txt_file in txt_files:
+        output_file = output_path / f"{txt_file.stem}_s_parameters.csv"
+        print(f"\nProcessing: {txt_file.name}")
+        
+        try:
+            df = parse_text_to_csv_auto_detect(str(txt_file), str(output_file))
+            if df is not None:
+                print(f"✓ Successfully converted {txt_file.name}")
+                preview_data(df, num_rows=3)
+            else:
+                print(f"✗ Failed to convert {txt_file.name}")
+        except Exception as e:
+            print(f"✗ Error converting {txt_file.name}: {str(e)}")
+
+def main():
+    """
+    Main function for S-parameter column conversion
+    """
+    print("="*60)
+    print("FREQUENCY DATA TO S-PARAMETER CSV CONVERTER")
+    print("="*60)
+    
+    input_file = "r5.txt"
+    output_file = "s_parameters_data.csv"
+    
+    if not os.path.exists(input_file):
+        print(f"Input file '{input_file}' not found!")
+        
+        # Try to find .txt files in current directory
+        txt_files = list(Path('.').glob("*.txt"))
+        if txt_files:
+            print(f"\nFound these .txt files in current directory:")
+            for i, file in enumerate(txt_files):
+                print(f"  {i+1}. {file.name}")
+            print(f"\nUpdate the 'input_file' variable to use one of these files.")
+        return
+    
+    try:
+        print("Choose conversion method:")
+        print("1. Auto-detect frequency groups (recommended)")
+        print("2. Parse existing S-parameter names from file")
+        
+        # For automatic execution, using method 1
+        method = 1
+        
+        if method == 1:
+            df = parse_text_to_csv_auto_detect(input_file, output_file)
+        else:
+            df = parse_text_to_csv_by_frequency(input_file, output_file)
+        
+        if df is not None:
+            preview_data(df)
+        else:
+            print("Conversion failed. Please check your input file format.")
+            
+    except Exception as e:
+        print(f"Error during conversion: {str(e)}")
+
+if __name__ == "__main__":
+    main()
